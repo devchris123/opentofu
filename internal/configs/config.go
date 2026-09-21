@@ -8,6 +8,7 @@ package configs
 import (
 	"fmt"
 	"log"
+	"maps"
 	"sort"
 
 	version "github.com/hashicorp/go-version"
@@ -877,6 +878,8 @@ func (c *Config) TransformForTest(run *TestRun, file *TestFile, evalCtx *hcl.Eva
 	// currently all the functions operate on different fields of configuration.
 	transformFuncs := []testConfigTransformFunc{
 		c.getProviderConfigTransformForTest(evalCtx),
+		// Requirements depend on the provider configurations selected above.
+		c.getProviderRequirementsTransformForTest(),
 		c.transformOverriddenResourcesForTest,
 		c.transformOverriddenModulesForTest,
 	}
@@ -1019,6 +1022,61 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 			// Reset the original config within the returned function.
 			c.Module.ProviderConfigs = previous
 		}, diags
+	}
+}
+
+func (c *Config) getProviderRequirementsTransformForTest() testConfigTransformFunc {
+	return func(run *TestRun, testFile *TestFile) (func(), hcl.Diagnostics) {
+		previous := c.Module.ProviderRequirements
+		reset := func() {
+			c.Module.ProviderRequirements = previous
+		}
+		if testFile == nil || testFile.ProviderRequirements == nil {
+			return reset, nil
+		}
+
+		// Allocate a separate wrapper and map only when adding a requirement.
+		// The original requirements may also be referenced by the root or other runs.
+		var next *RequiredProviders
+
+		for _, prov := range c.Module.ProviderConfigs {
+			childName := prov.Name
+			parentName := prov.Name
+			if run != nil {
+				for _, p := range run.Providers {
+					if p.InParent != nil && p.InChild != nil && p.InChild.Name == prov.Name && p.InChild.Alias == prov.Alias {
+						parentName = p.InParent.Name
+						break
+					}
+				}
+			}
+
+			if c.Module.ProviderRequirements != nil {
+				if _, exists := c.Module.ProviderRequirements.RequiredProviders[childName]; exists {
+					continue
+				}
+			}
+			provReq, exists := testFile.ProviderRequirements.RequiredProviders[parentName]
+			if !exists {
+				continue
+			}
+			if next == nil {
+				next = &RequiredProviders{}
+				if previous != nil {
+					*next = *previous
+				}
+				next.RequiredProviders = make(map[string]*RequiredProvider)
+				if previous != nil {
+					maps.Copy(next.RequiredProviders, previous.RequiredProviders)
+				}
+				c.Module.ProviderRequirements = next
+			}
+			copied := *provReq
+			copied.Name = childName
+			next.RequiredProviders[childName] = &copied
+		}
+
+		return reset, nil
 	}
 }
 

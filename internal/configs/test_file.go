@@ -60,6 +60,10 @@ type TestFile struct {
 	// test.
 	Providers map[string]*Provider
 
+	// ProviderRequirements defines the set of required providers
+	// taken from the root module this test file is associated with.
+	ProviderRequirements *RequiredProviders
+
 	// Runs defines the sequential list of run blocks that should be executed in
 	// order.
 	Runs []*TestRun

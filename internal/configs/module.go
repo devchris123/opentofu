@@ -168,6 +168,9 @@ func NewModuleWithTests(primaryFiles, overrideFiles []*File, testFiles map[strin
 	mod, diags := NewModule(primaryFiles, overrideFiles, sourceDir, SelectiveLoadAll)
 	if mod != nil {
 		mod.Tests = testFiles
+		for _, file := range testFiles {
+			file.ProviderRequirements = mod.ProviderRequirements
+		}
 	}
 	return mod, diags
 }

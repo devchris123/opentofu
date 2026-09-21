@@ -854,6 +854,32 @@ func TestConfigWithDeprecatedVariables(t *testing.T) {
 	})
 }
 
+func convertToProviders(t *testing.T, contents map[string]string) map[string]*Provider {
+	t.Helper()
+
+	providers := make(map[string]*Provider)
+	for key, content := range contents {
+		parser := hclparse.NewParser()
+		file, diags := parser.ParseHCL([]byte(content), fmt.Sprintf("%s.hcl", key))
+		if diags.HasErrors() {
+			t.Fatal(diags.Error())
+		}
+
+		provider := &Provider{
+			Config: file.Body,
+		}
+
+		parts := strings.Split(key, ".")
+		provider.Name = parts[0]
+		if len(parts) > 1 {
+			provider.Alias = parts[1]
+		}
+
+		providers[key] = provider
+	}
+	return providers
+}
+
 func TestTransformForTest(t *testing.T) {
 
 	str := func(providers map[string]string) string {
@@ -862,32 +888,6 @@ func TestTransformForTest(t *testing.T) {
 			fmt.Fprintf(&buffer, "%s: %s\n", key, config)
 		}
 		return buffer.String()
-	}
-
-	convertToProviders := func(t *testing.T, contents map[string]string) map[string]*Provider {
-		t.Helper()
-
-		providers := make(map[string]*Provider)
-		for key, content := range contents {
-			parser := hclparse.NewParser()
-			file, diags := parser.ParseHCL([]byte(content), fmt.Sprintf("%s.hcl", key))
-			if diags.HasErrors() {
-				t.Fatal(diags.Error())
-			}
-
-			provider := &Provider{
-				Config: file.Body,
-			}
-
-			parts := strings.Split(key, ".")
-			provider.Name = parts[0]
-			if len(parts) > 1 {
-				provider.Alias = parts[1]
-			}
-
-			providers[key] = provider
-		}
-		return providers
 	}
 
 	validate := func(t *testing.T, msg string, expected map[string]string, actual map[string]*Provider) {
@@ -917,12 +917,29 @@ func TestTransformForTest(t *testing.T) {
 	}
 
 	tcs := map[string]struct {
-		configProviders   map[string]string
-		fileProviders     map[string]string
-		runProviders      []PassedProviderConfig
-		expectedProviders map[string]string
-		expectedErrors    []string
+		rootProviderReqs    map[string]*RequiredProvider
+		expectedRequirement string
+		configProviders     map[string]string
+		fileProviders       map[string]string
+		runProviders        []PassedProviderConfig
+		expectedProviders   map[string]string
+		expectedErrors      []string
 	}{
+		// The helper starts without providers, so the requirement can only be
+		// copied if requirement transformation runs after provider transformation.
+		"copies requirements after injecting test providers": {
+			configProviders:   map[string]string{},
+			fileProviders:     map[string]string{"docker": "source = \"testfile\""},
+			expectedProviders: map[string]string{"docker": "source = \"testfile\""},
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedRequirement: "docker",
+		},
 		"empty": {
 			configProviders:   make(map[string]string),
 			expectedProviders: make(map[string]string),
@@ -1049,12 +1066,14 @@ func TestTransformForTest(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			config := &Config{
 				Module: &Module{
-					ProviderConfigs: convertToProviders(t, tc.configProviders),
+					ProviderConfigs:      convertToProviders(t, tc.configProviders),
+					ProviderRequirements: &RequiredProviders{RequiredProviders: map[string]*RequiredProvider{}},
 				},
 			}
 
 			file := &TestFile{
-				Providers: convertToProviders(t, tc.fileProviders),
+				Providers:            convertToProviders(t, tc.fileProviders),
+				ProviderRequirements: &RequiredProviders{RequiredProviders: tc.rootProviderReqs},
 			}
 
 			run := &TestRun{
@@ -1078,8 +1097,447 @@ func TestTransformForTest(t *testing.T) {
 			}
 
 			validate(t, "after transform mismatch", tc.expectedProviders, config.Module.ProviderConfigs)
+			if tc.expectedRequirement != "" && config.Module.ProviderRequirements.RequiredProviders[tc.expectedRequirement] == nil {
+				t.Errorf("missing %q requirement: requirements must be transformed after provider configurations", tc.expectedRequirement)
+			}
 			reset()
 			validate(t, "after reset mismatch", tc.configProviders, config.Module.ProviderConfigs)
+
+		})
+	}
+}
+
+func TestGetProviderRequirementsTransformForTest(t *testing.T) {
+
+	tcs := map[string]struct {
+		runProviders         []PassedProviderConfig
+		providers            map[string]*Provider
+		providerReqs         map[string]*RequiredProvider
+		rootProviderReqs     map[string]*RequiredProvider
+		expectedProviderReqs map[string]*RequiredProvider
+		expectedErrors       []string
+	}{
+		"root provider reqs with competing provider reqs will not override existing config": {
+			providers: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			providerReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "custom/docker",
+					Type:   addrs.NewProvider("custom.host", "custom-docker", "custom-docker"),
+				},
+			},
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "custom/docker",
+					Type:   addrs.NewProvider("custom.host", "custom-docker", "custom-docker"),
+				},
+			},
+		},
+
+		"root provider reqs with matching provider config will be copied over": {
+			providers: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			providerReqs: make(map[string]*RequiredProvider),
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+		},
+
+		"root provider reqs with no matching provider config will not be copied over": {
+			providers:    make(map[string]*Provider),
+			providerReqs: make(map[string]*RequiredProvider),
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: make(map[string]*RequiredProvider),
+		},
+
+		"renamed provider copies root requirement using original name": {
+			runProviders: []PassedProviderConfig{
+				{
+					InChild:  &ProviderConfigRef{Name: "alternate"},
+					InParent: &ProviderConfigRef{Name: "docker"},
+				},
+			},
+			providers: map[string]*Provider{
+				"alternate": {
+					Name: "alternate",
+				},
+			},
+			providerReqs: map[string]*RequiredProvider{},
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"alternate": {
+					Name:   "alternate",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+		},
+
+		"renamed provider preserves existing module requirement": {
+			runProviders: []PassedProviderConfig{
+				{
+					InChild:  &ProviderConfigRef{Name: "alternate"},
+					InParent: &ProviderConfigRef{Name: "docker"},
+				},
+			},
+			providers: map[string]*Provider{
+				"alternate": {
+					Name: "alternate",
+				},
+			},
+			providerReqs: map[string]*RequiredProvider{
+				"alternate": {
+					Name:   "alternate",
+					Source: "custom/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "custom", "docker"),
+				},
+			},
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"alternate": {
+					Name:   "alternate",
+					Source: "custom/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "custom", "docker"),
+				},
+			},
+		},
+
+		"renamed provider without original root requirement adds nothing": {
+			runProviders: []PassedProviderConfig{
+				{
+					InChild:  &ProviderConfigRef{Name: "alternate"},
+					InParent: &ProviderConfigRef{Name: "docker"},
+				},
+			},
+			providers: map[string]*Provider{
+				"alternate": {
+					Name: "alternate",
+				},
+			},
+			providerReqs: map[string]*RequiredProvider{},
+			rootProviderReqs: map[string]*RequiredProvider{
+				"alternate": {
+					Name:   "alternate",
+					Source: "unrelated/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "unrelated", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{},
+		},
+
+		"only matching root requirement is copied": {
+			providers: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			providerReqs: make(map[string]*RequiredProvider),
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+				"other": {
+					Name:   "other",
+					Source: "other/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "other", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+		},
+
+		"no configurations preserves helper and excludes root requirements": {
+			providers: make(map[string]*Provider),
+			providerReqs: map[string]*RequiredProvider{
+				"existing": {
+					Name:   "existing",
+					Source: "custom/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "custom", "docker"),
+				},
+			},
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"existing": {
+					Name:   "existing",
+					Source: "custom/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "custom", "docker"),
+				},
+			},
+		},
+
+		"no source requirement adds nothing": {
+			providers: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			providerReqs:         make(map[string]*RequiredProvider),
+			rootProviderReqs:     make(map[string]*RequiredProvider),
+			expectedProviderReqs: make(map[string]*RequiredProvider),
+		},
+
+		"explicit same name mapping copies requirement": {
+			providers: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			providerReqs: make(map[string]*RequiredProvider),
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			runProviders: []PassedProviderConfig{
+				{
+					InChild:  &ProviderConfigRef{Name: "docker"},
+					InParent: &ProviderConfigRef{Name: "docker"},
+				},
+			},
+		},
+
+		"aliased configuration uses unaliased requirement": {
+			providers: map[string]*Provider{
+				"docker.testing": {
+					Name:  "docker",
+					Alias: "testing",
+				},
+			},
+			providerReqs: make(map[string]*RequiredProvider),
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+		},
+
+		"renamed aliased parent copies requirement": {
+			providers: map[string]*Provider{
+				"alternate": {
+					Name: "alternate",
+				},
+			},
+			providerReqs: make(map[string]*RequiredProvider),
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"alternate": {
+					Name:   "alternate",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			runProviders: []PassedProviderConfig{
+				{
+					InChild:  &ProviderConfigRef{Name: "alternate"},
+					InParent: &ProviderConfigRef{Name: "docker", Alias: "testing"},
+				},
+			},
+		},
+
+		"renamed aliased parent preserves helper requirement": {
+			providers: map[string]*Provider{
+				"alternate": {
+					Name: "alternate",
+				},
+			},
+			providerReqs: map[string]*RequiredProvider{
+				"alternate": {
+					Name:   "alternate",
+					Source: "custom/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "custom", "docker"),
+				},
+			},
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"alternate": {
+					Name:   "alternate",
+					Source: "custom/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "custom", "docker"),
+				},
+			},
+			runProviders: []PassedProviderConfig{
+				{
+					InChild:  &ProviderConfigRef{Name: "alternate"},
+					InParent: &ProviderConfigRef{Name: "docker", Alias: "testing"},
+				},
+			},
+		},
+
+		"multiple aliases share one requirement": {
+			providers: map[string]*Provider{
+				"alternate.east": {
+					Name:  "alternate",
+					Alias: "east",
+				},
+				"alternate.west": {
+					Name:  "alternate",
+					Alias: "west",
+				},
+			},
+			providerReqs: make(map[string]*RequiredProvider),
+			rootProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Name:   "docker",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			expectedProviderReqs: map[string]*RequiredProvider{
+				"alternate": {
+					Name:   "alternate",
+					Source: "docker/docker",
+					Type:   addrs.NewProvider("registry.opentofu.org", "docker", "docker"),
+				},
+			},
+			runProviders: []PassedProviderConfig{
+				{
+					InChild:  &ProviderConfigRef{Name: "alternate", Alias: "east"},
+					InParent: &ProviderConfigRef{Name: "docker", Alias: "testing"},
+				},
+				{
+					InChild:  &ProviderConfigRef{Name: "alternate", Alias: "west"},
+					InParent: &ProviderConfigRef{Name: "docker", Alias: "production"},
+				},
+			},
+		},
+	}
+
+	for name, tc := range tcs {
+		t.Run(name, func(t *testing.T) {
+			// Setup
+			config := &Config{
+				Module: &Module{
+					ProviderConfigs: tc.providers,
+					ProviderRequirements: &RequiredProviders{
+						RequiredProviders: tc.providerReqs,
+					},
+				},
+			}
+			file := &TestFile{
+				ProviderRequirements: &RequiredProviders{
+					RequiredProviders: tc.rootProviderReqs,
+				},
+			}
+
+			// Snapshot values so renaming a shared requirement cannot mutate the expectation.
+			originalRootReqs := make(map[string]*RequiredProvider, len(tc.rootProviderReqs))
+			for name, req := range tc.rootProviderReqs {
+				copied := *req
+				originalRootReqs[name] = &copied
+			}
+			originalReqs := make(map[string]*RequiredProvider, len(tc.providerReqs))
+			for name, req := range tc.providerReqs {
+				copied := *req
+				originalReqs[name] = &copied
+			}
+			run := &TestRun{Providers: tc.runProviders}
+
+			// Execute
+			f := config.getProviderRequirementsTransformForTest()
+
+			// Assert
+			reset, diags := f(run, file)
+			if diags.HasErrors() {
+				t.Fatalf("unexpected diagnostics: %s", diags.Error())
+			}
+
+			if diff := cmp.Diff(tc.expectedProviderReqs, config.Module.ProviderRequirements.RequiredProviders, cmpopts.IgnoreFields(RequiredProvider{}, "Requirement")); len(diff) > 0 {
+				t.Errorf("unmatched provider requirements\nexpected:\n%v\nactual:\n%v\ndiff:\n%s", tc.expectedProviderReqs, config.Module.ProviderRequirements.RequiredProviders, diff)
+			}
+			if diff := cmp.Diff(originalRootReqs, file.ProviderRequirements.RequiredProviders, cmpopts.IgnoreFields(RequiredProvider{}, "Requirement")); diff != "" {
+				t.Errorf("root provider requirements changed (-want +got):\n%s", diff)
+			}
+			reset()
+			if diff := cmp.Diff(originalReqs, config.Module.ProviderRequirements.RequiredProviders, cmpopts.IgnoreFields(RequiredProvider{}, "Requirement")); diff != "" {
+				t.Errorf("requirements not restored after reset (-want +got):\n%s", diff)
+			}
 
 		})
 	}

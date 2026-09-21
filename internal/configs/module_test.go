@@ -15,6 +15,32 @@ import (
 	"github.com/zclconf/go-cty/cty"
 )
 
+func TestNewModuleWithTestsCopiesProviderRequirements(t *testing.T) {
+	rootRequirements := &RequiredProviders{
+		RequiredProviders: map[string]*RequiredProvider{
+			"docker": {
+				Name:   "docker",
+				Source: "docker/docker",
+				Type:   addrs.NewProvider(addrs.DefaultProviderRegistryHost, "docker", "docker"),
+			},
+		},
+	}
+	testFile := &TestFile{}
+
+	mod, diags := NewModuleWithTests(
+		[]*File{{RequiredProviders: []*RequiredProviders{rootRequirements}}},
+		nil,
+		map[string]*TestFile{"main.tftest.hcl": testFile},
+		"",
+	)
+	if diags.HasErrors() {
+		t.Fatal(diags.Error())
+	}
+	if testFile.ProviderRequirements != mod.ProviderRequirements {
+		t.Fatal("test file did not receive the root provider requirements")
+	}
+}
+
 // TestNewModule_provider_local_name exercises module.gatherProviderLocalNames()
 func TestNewModule_provider_local_name(t *testing.T) {
 	mod, diags := testModuleFromDir("testdata/providers-explicit-fqn")
