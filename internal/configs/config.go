@@ -873,13 +873,15 @@ type testConfigTransformFunc func(*TestRun, *TestFile) (func(), hcl.Diagnostics)
 // to reset the config before the next test.
 func (c *Config) TransformForTest(run *TestRun, file *TestFile, evalCtx *hcl.EvalContext) (func(), hcl.Diagnostics) {
 	var diags hcl.Diagnostics
+	// Map selected child configurations to their test-file provider names.
+	selectedProviders := make(map[string]string)
 
 	// These transformation functions must be in sync of what is being transformed,
 	// currently all the functions operate on different fields of configuration.
 	transformFuncs := []testConfigTransformFunc{
-		c.getProviderConfigTransformForTest(evalCtx),
+		c.getProviderConfigTransformForTest(evalCtx, selectedProviders),
 		// Requirements depend on the provider configurations selected above.
-		c.getProviderRequirementsTransformForTest(),
+		c.getProviderRequirementsTransformForTest(selectedProviders),
 		c.transformOverriddenResourcesForTest,
 		c.transformOverriddenModulesForTest,
 	}
@@ -903,7 +905,7 @@ func (c *Config) TransformForTest(run *TestRun, file *TestFile, evalCtx *hcl.Eva
 	}, diags
 }
 
-func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) testConfigTransformFunc {
+func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext, selectedProviders map[string]string) testConfigTransformFunc {
 	return func(run *TestRun, file *TestFile) (func(), hcl.Diagnostics) {
 		var diags hcl.Diagnostics
 
@@ -985,6 +987,7 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 					MockResources:     testProvider.MockResources,
 					OverrideResources: testProvider.OverrideResources,
 				}
+				selectedProviders[ref.InChild.String()] = ref.InParent.Name
 
 			}
 		} else {
@@ -997,6 +1000,7 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 					provider.Config = testProviderBody{originalBody: provider.Config, evalCtx: evalCtx}
 				}
 				next[key] = provider
+				selectedProviders[key] = provider.Name
 			}
 			for _, mp := range file.MockProviders {
 				providerDiags := mp.evaluateProviderConfig(evalCtx)
@@ -1013,6 +1017,7 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 					MockResources:     mp.MockResources,
 					OverrideResources: mp.OverrideResources,
 				}
+				selectedProviders[mp.moduleUniqueKey()] = mp.Name
 			}
 		}
 
@@ -1025,7 +1030,7 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 	}
 }
 
-func (c *Config) getProviderRequirementsTransformForTest() testConfigTransformFunc {
+func (c *Config) getProviderRequirementsTransformForTest(selectedProviders map[string]string) testConfigTransformFunc {
 	return func(run *TestRun, testFile *TestFile) (func(), hcl.Diagnostics) {
 		previous := c.Module.ProviderRequirements
 		reset := func() {
@@ -1039,17 +1044,12 @@ func (c *Config) getProviderRequirementsTransformForTest() testConfigTransformFu
 		// The original requirements may also be referenced by the root or other runs.
 		var next *RequiredProviders
 
-		for _, prov := range c.Module.ProviderConfigs {
-			childName := prov.Name
-			parentName := prov.Name
-			if run != nil {
-				for _, p := range run.Providers {
-					if p.InParent != nil && p.InChild != nil && p.InChild.Name == prov.Name && p.InChild.Alias == prov.Alias {
-						parentName = p.InParent.Name
-						break
-					}
-				}
+		for key, parentName := range selectedProviders {
+			prov, exists := c.Module.ProviderConfigs[key]
+			if !exists {
+				continue
 			}
+			childName := prov.Name
 
 			if c.Module.ProviderRequirements != nil {
 				if _, exists := c.Module.ProviderRequirements.RequiredProviders[childName]; exists {

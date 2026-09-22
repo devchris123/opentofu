@@ -1107,6 +1107,55 @@ func TestTransformForTest(t *testing.T) {
 	}
 }
 
+func TestTransformForTestPreservesExistingProviderSource(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		testProviders map[string]*Provider
+		expectDocker  bool
+	}{
+		{name: "no test providers"},
+		{
+			name:          "unrelated test provider is copied",
+			testProviders: map[string]*Provider{"docker": {Name: "docker"}},
+			expectDocker:  true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := &Config{Module: &Module{
+				ProviderConfigs: map[string]*Provider{
+					"terraform": {Name: "terraform"},
+				},
+				ProviderRequirements: &RequiredProviders{RequiredProviders: map[string]*RequiredProvider{}},
+			}}
+			file := &TestFile{
+				Providers: tc.testProviders,
+				ProviderRequirements: &RequiredProviders{RequiredProviders: map[string]*RequiredProvider{
+					"terraform": {Name: "terraform", Type: addrs.NewProvider("registry.opentofu.org", "docker", "docker")},
+					"docker":    {Name: "docker", Type: addrs.NewProvider("registry.opentofu.org", "docker", "docker")},
+				}},
+			}
+			evalCtx := &hcl.EvalContext{Variables: map[string]cty.Value{
+				"run": cty.ObjectVal(map[string]cty.Value{}),
+				"var": cty.ObjectVal(map[string]cty.Value{}),
+			}}
+
+			reset, diags := config.TransformForTest(&TestRun{}, file, evalCtx)
+			if diags.HasErrors() {
+				t.Fatal(diags.Error())
+			}
+			defer reset()
+
+			if got := config.Module.ProviderForLocalConfig(addrs.LocalProviderConfig{LocalName: "terraform"}); got != addrs.NewBuiltInProvider("terraform") {
+				t.Errorf("existing helper provider changed source to %s", got)
+			}
+			_, hasDocker := config.Module.ProviderRequirements.RequiredProviders["docker"]
+			if hasDocker != tc.expectDocker {
+				t.Errorf("copied test provider requirement present = %t, want %t", hasDocker, tc.expectDocker)
+			}
+		})
+	}
+}
+
 func TestGetProviderRequirementsTransformForTest(t *testing.T) {
 
 	tcs := map[string]struct {
@@ -1520,7 +1569,14 @@ func TestGetProviderRequirementsTransformForTest(t *testing.T) {
 			run := &TestRun{Providers: tc.runProviders}
 
 			// Execute
-			f := config.getProviderRequirementsTransformForTest()
+			selectedProviders := make(map[string]string)
+			for key, provider := range tc.providers {
+				selectedProviders[key] = provider.Name
+			}
+			for _, provider := range tc.runProviders {
+				selectedProviders[provider.InChild.String()] = provider.InParent.Name
+			}
+			f := config.getProviderRequirementsTransformForTest(selectedProviders)
 
 			// Assert
 			reset, diags := f(run, file)
