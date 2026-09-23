@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 
 	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
@@ -900,6 +901,90 @@ func (c *Config) TransformForTest(run *TestRun, file *TestFile, evalCtx *hcl.Eva
 	}, diags
 }
 
+// inferredTestProviderConfigNames finds provider configuration names that can be
+// used by this module. A requirement counts even without a resource: prior run
+// state can still need that provider during refresh or cleanup. Keep the names
+// (including aliases) here; ProviderRequirements loses that information when it
+// combines dependencies by provider source address.
+func (c *Config) inferredTestProviderConfigNames() map[string]bool {
+	inferredConfigNames := make(map[string]bool)
+	if c.Module.ProviderRequirements != nil {
+		for name, req := range c.Module.ProviderRequirements.RequiredProviders {
+			inferredConfigNames[name] = true
+			for _, alias := range req.Aliases {
+				inferredConfigNames[alias.StringCompact()] = true
+			}
+		}
+	}
+	for key := range c.Module.ProviderConfigs {
+		inferredConfigNames[key] = true
+	}
+	for _, resources := range []map[string]*Resource{
+		c.Module.ManagedResources,
+		c.Module.DataResources,
+		c.Module.EphemeralResources,
+	} {
+		for _, resource := range resources {
+			if resource.ProviderConfigRef != nil {
+				inferredConfigNames[resource.ProviderConfigRef.String()] = true
+			} else {
+				inferredConfigNames[resource.Addr().ImpliedProvider()] = true
+			}
+		}
+	}
+	for _, imp := range c.Module.Import {
+		if imp.ProviderConfigRef != nil {
+			inferredConfigNames[imp.ProviderConfigRef.String()] = true
+		} else {
+			inferredConfigNames[imp.StaticTo.Resource.ImpliedProvider()] = true
+		}
+	}
+	// Loop over child module calls and find inferred provider configurations by parent name.
+	// e.g.
+	// module "child" {
+	//   source = "./child"
+	//   providers = {
+	//     aws = aws.us-east-1
+	//   }
+	// }
+	// -> child: aws, parent: aws.us-east-1
+	for name, child := range c.Children {
+		call := c.Module.ModuleCalls[name]
+		parentNameByChild := make(map[string]string)
+		if call != nil {
+			for _, ref := range call.Providers {
+				parentNameByChild[ref.InChild.String()] = ref.InParent.String()
+				inferredConfigNames[ref.InParent.String()] = true
+			}
+		}
+		for childName := range child.inferredTestProviderConfigNames() {
+			if childConfig, exists := child.Module.ProviderConfigs[childName]; exists {
+				// Empty legacy provider blocks are proxy declarations: they
+				// still expect a configuration from the parent.
+				_, diags := childConfig.Config.Content(&hcl.BodySchema{})
+				if diags.HasErrors() || childConfig.Version.Required != nil || childConfig.ForEach != nil {
+					continue
+				}
+			}
+			if parentName, explicit := parentNameByChild[childName]; explicit {
+				inferredConfigNames[parentName] = true
+				continue
+			}
+			if call != nil && len(call.Providers) > 0 {
+				// An explicit providers map disables default inheritance
+				// for configurations that it does not mention.
+				continue
+			}
+			// Aliases do not inherit implicitly. Unaliased configurations
+			// inherit only where the provider identities agree.
+			if !strings.Contains(childName, ".") && c.Module.ProviderForLocalConfig(addrs.LocalProviderConfig{LocalName: childName}).Equals(child.Module.ProviderForLocalConfig(addrs.LocalProviderConfig{LocalName: childName})) {
+				inferredConfigNames[childName] = true
+			}
+		}
+	}
+	return inferredConfigNames
+}
+
 func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) testConfigTransformFunc {
 	return func(run *TestRun, file *TestFile) (func(), hcl.Diagnostics) {
 		var diags hcl.Diagnostics
@@ -919,9 +1004,9 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 		//       only the specified providers from the test file into `next`. While
 		//       doing this we ensure to preserve the name and alias from the
 		//       original config.
-		//   3b. If the run has no override configuration, we copy all the providers
-		//       (including mocks) from the test file into `next`, overriding all providers
-		//       with name collisions from the original config.
+		//   3b. If the run has no override configuration, we copy providers
+		//       (including mocks) from the test file into `next`. For an alternate
+		//       module, we copy only configurations that module can use.
 		//   4. We then modify the original configuration so that the providers it
 		//      holds are the combination specified by the original config, the test
 		//      file and the run file.
@@ -985,9 +1070,16 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 
 			}
 		} else {
+			var providersToCopy map[string]bool
+			if run != nil && run.ConfigUnderTest != nil {
+				providersToCopy = c.inferredTestProviderConfigNames()
+			}
 			// Otherwise, let's copy over and overwrite all providers specified by
-			// the test file itself.
+			// the test file itself that the alternate configuration can use.
 			for key, provider := range file.Providers {
+				if providersToCopy != nil && !providersToCopy[key] {
+					continue
+				}
 				// If we have test run block output and provider config exists we can use testProviderBody to wrap it.
 				// It can be used to evaluate run block expressions inside provider config with prepared evalCtx.
 				if ctxRunOutputExists && provider.Config != nil {
@@ -996,6 +1088,9 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 				next[key] = provider
 			}
 			for _, mp := range file.MockProviders {
+				if providersToCopy != nil && !providersToCopy[mp.moduleUniqueKey()] {
+					continue
+				}
 				providerDiags := mp.evaluateProviderConfig(evalCtx)
 				diags = append(diags, providerDiags...)
 				next[mp.moduleUniqueKey()] = &Provider{

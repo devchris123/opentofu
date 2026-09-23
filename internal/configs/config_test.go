@@ -854,6 +854,92 @@ func TestConfigWithDeprecatedVariables(t *testing.T) {
 	})
 }
 
+func TestTestProviderConfigDependencies(t *testing.T) {
+	docker := addrs.NewProvider(addrs.DefaultProviderRegistryHost, "docker", "docker")
+	child := &Config{Module: &Module{
+		ProviderRequirements: &RequiredProviders{RequiredProviders: map[string]*RequiredProvider{
+			"docker": {Name: "docker", Type: docker},
+		}},
+	}}
+	cfg := &Config{
+		Module: &Module{
+			ProviderRequirements: &RequiredProviders{RequiredProviders: map[string]*RequiredProvider{
+				"docker": {Name: "docker", Type: docker, Aliases: []addrs.LocalProviderConfig{{LocalName: "docker", Alias: "other"}}},
+			}},
+			ManagedResources: map[string]*Resource{
+				"docker_image.example": {Type: "docker_image", ProviderConfigRef: &ProviderConfigRef{Name: "docker", Alias: "selected"}},
+			},
+			ModuleCalls: map[string]*ModuleCall{"child": {Name: "child"}},
+		},
+		Children: map[string]*Config{"child": child},
+	}
+	want := map[string]bool{"docker": true, "docker.other": true, "docker.selected": true}
+	if diff := cmp.Diff(want, cfg.inferredTestProviderConfigNames()); diff != "" {
+		t.Fatal(diff)
+	}
+
+	// Without its own requirement, the helper resolves docker to
+	// hashicorp/docker, which differs from the child's docker/docker.
+	// The child must not cause an incompatible configuration to be copied.
+	delete(cfg.Module.ProviderRequirements.RequiredProviders, "docker")
+	cfg.Module.ManagedResources = nil
+	if got := cfg.inferredTestProviderConfigNames(); len(got) != 0 {
+		t.Fatalf("unexpected dependencies: %v", got)
+	}
+}
+
+func TestTestProviderConfigDependenciesChildMapping(t *testing.T) {
+	child := &Config{Module: &Module{
+		ProviderRequirements: &RequiredProviders{RequiredProviders: map[string]*RequiredProvider{
+			"child": {Name: "child", Type: addrs.NewDefaultProvider("child")},
+			"other": {Name: "other", Type: addrs.NewDefaultProvider("other")},
+		}},
+	}}
+	cfg := &Config{
+		Module: &Module{ModuleCalls: map[string]*ModuleCall{
+			"nested": {Name: "nested", Providers: []PassedProviderConfig{{
+				InChild: &ProviderConfigRef{Name: "child"}, InParent: &ProviderConfigRef{Name: "parent", Alias: "selected"},
+			}}},
+		}},
+		Children: map[string]*Config{"nested": child},
+	}
+	if diff := cmp.Diff(map[string]bool{"parent.selected": true}, cfg.inferredTestProviderConfigNames()); diff != "" {
+		t.Fatal(diff)
+	}
+	child.Module.ProviderConfigs = map[string]*Provider{"child": {Name: "child", Config: hcl.EmptyBody()}}
+	if diff := cmp.Diff(map[string]bool{"parent.selected": true}, cfg.inferredTestProviderConfigNames()); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func TestTestProviderConfigDependenciesProxy(t *testing.T) {
+	child := &Config{Module: &Module{
+		ProviderRequirements: &RequiredProviders{RequiredProviders: map[string]*RequiredProvider{}},
+		ProviderConfigs: map[string]*Provider{
+			"foo": {Name: "foo", Config: hcl.EmptyBody()},
+		},
+	}}
+	cfg := &Config{
+		Module: &Module{
+			ProviderRequirements: &RequiredProviders{RequiredProviders: map[string]*RequiredProvider{}},
+			ModuleCalls:          map[string]*ModuleCall{"nested": {Name: "nested"}},
+		},
+		Children: map[string]*Config{"nested": child},
+	}
+	if diff := cmp.Diff(map[string]bool{"foo": true}, cfg.inferredTestProviderConfigNames()); diff != "" {
+		t.Fatal(diff)
+	}
+
+	parsed, diags := hclparse.NewParser().ParseHCL([]byte("region = \"example\""), "provider.hcl")
+	if diags.HasErrors() {
+		t.Fatal(diags.Error())
+	}
+	child.Module.ProviderConfigs["foo"].Config = parsed.Body
+	if got := cfg.inferredTestProviderConfigNames(); len(got) != 0 {
+		t.Fatalf("configured child provider should not need a parent configuration: %v", got)
+	}
+}
+
 func TestTransformForTest(t *testing.T) {
 
 	str := func(providers map[string]string) string {
@@ -919,7 +1005,9 @@ func TestTransformForTest(t *testing.T) {
 	tcs := map[string]struct {
 		configProviders   map[string]string
 		fileProviders     map[string]string
+		requiredProviders []string
 		runProviders      []PassedProviderConfig
+		rootRun           bool
 		expectedProviders map[string]string
 		expectedErrors    []string
 	}{
@@ -943,9 +1031,29 @@ func TestTransformForTest(t *testing.T) {
 				"foo": "source = \"testfile\"",
 				"bar": "source = \"testfile\"",
 			},
+			expectedProviders: map[string]string{},
+		},
+		"root run keeps test file providers": {
+			rootRun:         true,
+			configProviders: map[string]string{},
+			fileProviders: map[string]string{
+				"foo": "source = \"testfile\"",
+			},
 			expectedProviders: map[string]string{
 				"foo": "source = \"testfile\"",
-				"bar": "source = \"testfile\"",
+			},
+		},
+		"implicit selection keeps a required provider and its alias": {
+			configProviders:   map[string]string{},
+			requiredProviders: []string{"foo", "foo.other"},
+			fileProviders: map[string]string{
+				"foo":       "source = \"testfile\"",
+				"foo.other": "source = \"alias\"",
+				"bar":       "source = \"unused\"",
+			},
+			expectedProviders: map[string]string{
+				"foo":       "source = \"testfile\"",
+				"foo.other": "source = \"alias\"",
 			},
 		},
 		"only providers in run block": {
@@ -1047,9 +1155,22 @@ func TestTransformForTest(t *testing.T) {
 	}
 	for name, tc := range tcs {
 		t.Run(name, func(t *testing.T) {
+			requirements := &RequiredProviders{RequiredProviders: map[string]*RequiredProvider{}}
+			for _, key := range tc.requiredProviders {
+				parts := strings.SplitN(key, ".", 2)
+				req, exists := requirements.RequiredProviders[parts[0]]
+				if !exists {
+					req = &RequiredProvider{Name: parts[0], Type: addrs.NewDefaultProvider(parts[0])}
+					requirements.RequiredProviders[parts[0]] = req
+				}
+				if len(parts) == 2 {
+					req.Aliases = append(req.Aliases, addrs.LocalProviderConfig{LocalName: parts[0], Alias: parts[1]})
+				}
+			}
 			config := &Config{
 				Module: &Module{
-					ProviderConfigs: convertToProviders(t, tc.configProviders),
+					ProviderConfigs:      convertToProviders(t, tc.configProviders),
+					ProviderRequirements: requirements,
 				},
 			}
 
@@ -1058,7 +1179,11 @@ func TestTransformForTest(t *testing.T) {
 			}
 
 			run := &TestRun{
-				Providers: tc.runProviders,
+				Providers:       tc.runProviders,
+				ConfigUnderTest: config,
+			}
+			if tc.rootRun {
+				run.ConfigUnderTest = nil
 			}
 
 			evalCtx := &hcl.EvalContext{
