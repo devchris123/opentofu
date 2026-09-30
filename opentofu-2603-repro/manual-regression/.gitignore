@@ -1,0 +1,4 @@
+**/.terraform/
+**/init.log
+**/test.log
+__pycache__/

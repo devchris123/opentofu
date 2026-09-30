@@ -1022,6 +1022,23 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 	}
 }
 
+// getInferredProviderConfigNames returns a set of config names for providers,
+// that are explicitly or implicitly used by the configuration's module or by one of its children.
+//
+// This is used in conjunction with getProviderConfigTransformForTest to only
+// copy provider configurations that are really needed.
+//
+// More narrowly copying providers avoids issues with provider configs
+// that later cause validation errors, which is confusing if providers are not even used.
+// See https://github.com/opentofu/opentofu/issues/2603
+func (c *Config) getInferredProviderConfigNames() map[string]bool {
+	inferredConfigNames := make(map[string]bool)
+	// Check for provider usage in
+	// - explicit requirements, resources, imports, recurse module calls
+
+	return inferredConfigNames
+}
+
 // evaluateProviderConfig evaluates code for the mock provider. for_each is the only attribute
 // that is evaluated for the mock provider, but support for other provider attributes can be added
 // here if needed.

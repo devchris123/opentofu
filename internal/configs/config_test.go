@@ -1085,6 +1085,10 @@ func TestTransformForTest(t *testing.T) {
 	}
 }
 
+func TestGetInferredProviderConfigNames(t *testing.T) {
+
+}
+
 func TestEntersNewPackage(t *testing.T) {
 	parseModuleSource := func(t *testing.T, source string) addrs.ModuleSource {
 		s, err := addrs.ParseModuleSource(source)

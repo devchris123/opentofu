@@ -1,0 +1,5 @@
+bin/
+**/.terraform/
+*.log
+*.exit-code
+**/*.tfstate*
