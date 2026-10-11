@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 
 	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/hcl/v2"
@@ -987,7 +988,15 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 		} else {
 			// Otherwise, let's copy over and overwrite all providers specified by
 			// the test file itself.
+			inferredProviders := c.getInferredProviderConfigNames()
 			for key, provider := range file.Providers {
+				_, inferred := inferredProviders[key]
+				_, configured := previous[key]
+				if !inferred && !configured {
+					// Keep overrides of existing configurations, but skip additional
+					// providers that aren't used by the configuration under test.
+					continue
+				}
 				// If we have test run block output and provider config exists we can use testProviderBody to wrap it.
 				// It can be used to evaluate run block expressions inside provider config with prepared evalCtx.
 				if ctxRunOutputExists && provider.Config != nil {
@@ -996,9 +1005,16 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 				next[key] = provider
 			}
 			for _, mp := range file.MockProviders {
+				key := mp.moduleUniqueKey()
+				_, inferred := inferredProviders[key]
+				_, configured := previous[key]
+				if !inferred && !configured {
+					// Unused mocks should neither be evaluated nor introduce provider dependencies.
+					continue
+				}
 				providerDiags := mp.evaluateProviderConfig(evalCtx)
 				diags = append(diags, providerDiags...)
-				next[mp.moduleUniqueKey()] = &Provider{
+				next[key] = &Provider{
 					Name:              mp.Name,
 					NameRange:         mp.NameRange,
 					Alias:             mp.Alias,
@@ -1020,6 +1036,100 @@ func (c *Config) getProviderConfigTransformForTest(evalCtx *hcl.EvalContext) tes
 			c.Module.ProviderConfigs = previous
 		}, diags
 	}
+}
+
+// getInferredProviderConfigNames returns a set of config names for providers,
+// that are explicitly or implicitly used by the configuration's module or by one of its children.
+//
+// This is used in conjunction with getProviderConfigTransformForTest to only
+// copy provider configurations that are really needed.
+//
+// More narrowly copying providers avoids issues with provider configs
+// that later cause validation errors, which is confusing if providers are not even used.
+// See https://github.com/opentofu/opentofu/issues/2603
+func (c *Config) getInferredProviderConfigNames() map[string]bool {
+	inferredConfigNames := make(map[string]bool)
+	// Check for provider usage in
+	// - explicit requirements, resources, imports, recurse module calls and child configs
+
+	// requirements
+	if c.Module.ProviderRequirements != nil {
+		for key := range c.Module.ProviderRequirements.RequiredProviders {
+			inferredConfigNames[key] = true
+		}
+	}
+
+	// imports
+	for _, provImp := range c.Module.Import {
+		if len(provImp.StaticTo.Module) > 0 {
+			// Child resource providers are accounted for by child analysis and
+			// translated through the corresponding module call's provider mappings.
+			continue
+		}
+		if c.Module.ManagedResources[provImp.StaticTo.String()] != nil {
+			// An existing target resource determines the provider for the import.
+			// Resource analysis below accounts for both explicit and implied providers.
+			continue
+		}
+		if provImp.ProviderConfigRef != nil {
+			inferredConfigNames[provImp.ProviderConfigRef.String()] = true
+		} else {
+			inferredConfigNames[provImp.StaticTo.Resource.ImpliedProvider()] = true
+		}
+	}
+
+	// resources
+	for _, resources := range []map[string]*Resource{
+		c.Module.ManagedResources,
+		c.Module.DataResources,
+		c.Module.EphemeralResources,
+	} {
+		for _, res := range resources {
+			if res.ProviderConfigRef != nil {
+				inferredConfigNames[res.ProviderConfigRef.String()] = true
+			} else {
+				impliedName := res.Addr().ImpliedProvider()
+				inferredConfigNames[impliedName] = true
+			}
+		}
+	}
+
+	// module calls
+	for childName, modCall := range c.Module.ModuleCalls {
+		childToParentNames := make(map[string]string)
+		for _, passedProv := range modCall.Providers {
+			inferredConfigNames[passedProv.InParent.String()] = true
+			childToParentNames[passedProv.InChild.String()] = passedProv.InParent.String()
+		}
+		child, ok := c.Children[childName]
+		if !ok {
+			continue
+		}
+		childInferredConfigNames := child.getInferredProviderConfigNames()
+		for childName := range childInferredConfigNames {
+			if child.Module.ProviderConfigs[childName] != nil {
+				continue
+			}
+			if parentName, ok := childToParentNames[childName]; ok {
+				inferredConfigNames[parentName] = true
+			} else if !strings.Contains(childName, ".") {
+				// Skip unmapped aliased provider references. Aliased configurations
+				// must be defined in the child or passed explicitly through its module
+				// call, so propagating these references would cause unnecessary copying.
+				// Default inheritance matches provider identities, which may have
+				// different local names in the child and parent modules.
+				providerType := addrs.ImpliedProviderForUnqualifiedType(childName)
+				if child.Module.ProviderRequirements != nil {
+					providerType = child.Module.ProviderForLocalConfig(addrs.LocalProviderConfig{
+						LocalName: childName,
+					})
+				}
+				inferredConfigNames[c.Module.LocalNameForProvider(providerType)] = true
+			}
+		}
+	}
+
+	return inferredConfigNames
 }
 
 // evaluateProviderConfig evaluates code for the mock provider. for_each is the only attribute

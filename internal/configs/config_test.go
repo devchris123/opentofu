@@ -937,16 +937,13 @@ func TestTransformForTest(t *testing.T) {
 				"bar": "source = \"config\"",
 			},
 		},
-		"only providers in test file": {
+		"unused providers only in test file are not copied": {
 			configProviders: make(map[string]string),
 			fileProviders: map[string]string{
 				"foo": "source = \"testfile\"",
 				"bar": "source = \"testfile\"",
 			},
-			expectedProviders: map[string]string{
-				"foo": "source = \"testfile\"",
-				"bar": "source = \"testfile\"",
-			},
+			expectedProviders: map[string]string{},
 		},
 		"only providers in run block": {
 			configProviders: make(map[string]string),
@@ -1032,7 +1029,8 @@ func TestTransformForTest(t *testing.T) {
 			runProviders: []PassedProviderConfig{
 				{
 					InChild: &ProviderConfigRef{
-						Name: "foo.secondary",
+						Name:  "foo",
+						Alias: "secondary",
 					},
 					InParent: &ProviderConfigRef{
 						Name: "foo",
@@ -1081,6 +1079,889 @@ func TestTransformForTest(t *testing.T) {
 			reset()
 			validate(t, "after reset mismatch", tc.configProviders, config.Module.ProviderConfigs)
 
+		})
+	}
+}
+
+func TestGetProviderConfigTransformForTest(t *testing.T) {
+
+	type TestTable struct {
+		testConfigProviderConfigs    map[string]*Provider
+		testConfigProviderReqs       map[string]*RequiredProvider
+		testConfigImports            []*Import
+		testConfigManagedResources   map[string]*Resource
+		testConfigDataResources      map[string]*Resource
+		testConfigEphemeralResources map[string]*Resource
+		testConfigModuleCalls        map[string]*ModuleCall
+		testConfigChildModules       map[string]*Config
+		testRunPassedProviders       []PassedProviderConfig
+		testFileProviderConfigs      map[string]*Provider
+		testFileMockProviders        map[string]*MockProvider
+		expectedProviderConfigs      map[string]*Provider
+	}
+
+	// test tables
+	testTable := map[string]TestTable{
+		"do not copy unused providerconfigs": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testRunPassedProviders:    make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: make(map[string]*Provider),
+		},
+		"copy providerconfigs required by config": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs: map[string]*RequiredProvider{
+				"docker": {
+					Source: "docker",
+					Type:   addrs.NewDefaultProvider("docker"),
+				},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+		},
+		"copy providerconfigs required by run": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testRunPassedProviders: []PassedProviderConfig{
+				{
+					InChild: &ProviderConfigRef{
+						Name: "docker",
+					},
+					InParent: &ProviderConfigRef{
+						Name: "docker",
+					},
+				},
+			},
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+		},
+		"copy providerconfigs required by an import": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testConfigImports: []*Import{
+				{
+					ProviderConfigRef: &ProviderConfigRef{
+						Name:  "docker",
+						Alias: "special",
+					},
+				},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+		},
+		"copy providerconfigs required by an import with implied name": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testConfigImports: []*Import{
+				{
+					StaticTo: addrs.ConfigResource{
+						Resource: addrs.Resource{
+							Name: "example",
+							Type: "docker_container",
+						},
+					},
+				},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+		},
+		"copy providerconfigs required by managed resource": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testConfigManagedResources: map[string]*Resource{
+				"docker_container": {
+					Name: "docker_container",
+					Mode: addrs.ManagedResourceMode,
+					ProviderConfigRef: &ProviderConfigRef{
+						Name: "docker",
+					},
+				},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+		},
+		"copy providerconfigs required by data resource": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testConfigDataResources: map[string]*Resource{
+				"docker_image": {
+					Name: "docker_image",
+					Mode: addrs.DataResourceMode,
+					ProviderConfigRef: &ProviderConfigRef{
+						Name: "docker",
+					},
+				},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+		},
+		"copy providerconfigs required by ephemeral resource": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testConfigEphemeralResources: map[string]*Resource{
+				"docker_secret": {
+					Name: "docker_secret",
+					Mode: addrs.EphemeralResourceMode,
+					ProviderConfigRef: &ProviderConfigRef{
+						Name:  "docker",
+						Alias: "special",
+					},
+				},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+		},
+		"copy providerconfig based on implied resource type": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testConfigManagedResources: map[string]*Resource{
+				"docker_container": {
+					Type: "docker_container",
+					Name: "example",
+					Mode: addrs.ManagedResourceMode,
+				},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+		},
+		"copy providerconfigs required by required provider in child module": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testConfigChildModules: map[string]*Config{
+				"child": {
+					Module: &Module{
+						ProviderRequirements: &RequiredProviders{
+							RequiredProviders: map[string]*RequiredProvider{
+								"docker": {
+									Source: "docker",
+									Type:   addrs.NewDefaultProvider("docker"),
+								},
+							},
+						},
+					},
+				},
+			},
+			testConfigModuleCalls: map[string]*ModuleCall{
+				"child": {},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+		},
+		"copy providerconfigs required by a module call": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testConfigChildModules: map[string]*Config{
+				"child": {
+					Module: &Module{},
+				},
+			},
+			testConfigModuleCalls: map[string]*ModuleCall{
+				"child": {
+					Providers: []PassedProviderConfig{
+						{
+							InChild: &ProviderConfigRef{
+								Name:  "docker",
+								Alias: "target",
+							},
+							InParent: &ProviderConfigRef{
+								Name:  "docker",
+								Alias: "special",
+							},
+						},
+					},
+				},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+		},
+		"copy providerconfigs required by child module based on the parent's module call passed names": {
+			testConfigProviderConfigs: make(map[string]*Provider),
+			testConfigProviderReqs:    make(map[string]*RequiredProvider),
+			testConfigChildModules: map[string]*Config{
+				"child": {
+					Module: &Module{
+						ProviderRequirements: &RequiredProviders{
+							RequiredProviders: map[string]*RequiredProvider{
+								"docker": {
+									Source: "docker",
+									Type:   addrs.NewDefaultProvider("docker"),
+								},
+							},
+						},
+					},
+				},
+			},
+			testConfigModuleCalls: map[string]*ModuleCall{
+				"child": {
+					Providers: []PassedProviderConfig{
+						{
+							InChild: &ProviderConfigRef{
+								Name: "docker",
+							},
+							InParent: &ProviderConfigRef{
+								Name:  "docker",
+								Alias: "special",
+							},
+						},
+					},
+				},
+			},
+			testRunPassedProviders: make([]PassedProviderConfig, 0),
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+		},
+		"keep sibling provider mappings independent": {
+			testConfigModuleCalls: map[string]*ModuleCall{
+				"mapped": {
+					Providers: []PassedProviderConfig{
+						{
+							InChild: &ProviderConfigRef{
+								Name: "docker",
+							},
+							InParent: &ProviderConfigRef{
+								Name:  "docker",
+								Alias: "special",
+							},
+						},
+					},
+				},
+				"inherited": {},
+			},
+			testConfigChildModules: map[string]*Config{
+				"mapped": {
+					Module: &Module{
+						ManagedResources: map[string]*Resource{
+							"docker_container.example": {
+								Type: "docker_container",
+								Name: "example",
+								Mode: addrs.ManagedResourceMode,
+							},
+						},
+					},
+				},
+				"inherited": {
+					Module: &Module{
+						ManagedResources: map[string]*Resource{
+							"docker_container.example": {
+								Type: "docker_container",
+								Name: "example",
+								Mode: addrs.ManagedResourceMode,
+							},
+						},
+					},
+				},
+			},
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+				"docker.unused": {
+					Name:  "docker",
+					Alias: "unused",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+		},
+		"do not inherit a provider configured inside the child": {
+			testConfigModuleCalls: map[string]*ModuleCall{
+				"child": {},
+			},
+			testConfigChildModules: map[string]*Config{
+				"child": {
+					Module: &Module{
+						ProviderConfigs: map[string]*Provider{
+							"docker": {
+								Name: "docker",
+							},
+						},
+						ManagedResources: map[string]*Resource{
+							"docker_container.example": {
+								Type: "docker_container",
+								Name: "example",
+								Mode: addrs.ManagedResourceMode,
+							},
+						},
+					},
+				},
+			},
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{},
+		},
+		"do not inherit an unmapped provider alias from the child": {
+			testConfigModuleCalls: map[string]*ModuleCall{
+				"child": {},
+			},
+			testConfigChildModules: map[string]*Config{
+				"child": {
+					Module: &Module{
+						ManagedResources: map[string]*Resource{
+							"docker_container.example": {
+								Type: "docker_container",
+								Name: "example",
+								Mode: addrs.ManagedResourceMode,
+								ProviderConfigRef: &ProviderConfigRef{
+									Name:  "docker",
+									Alias: "special",
+								},
+							},
+						},
+					},
+				},
+			},
+			testFileProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{},
+		},
+		"resolve provider mappings through nested modules": {
+			testConfigModuleCalls: map[string]*ModuleCall{
+				"child": {
+					Providers: []PassedProviderConfig{
+						{
+							InChild: &ProviderConfigRef{
+								Name:  "docker",
+								Alias: "middle",
+							},
+							InParent: &ProviderConfigRef{
+								Name:  "docker",
+								Alias: "special",
+							},
+						},
+					},
+				},
+			},
+			testConfigChildModules: map[string]*Config{
+				"child": {
+					Module: &Module{
+						ModuleCalls: map[string]*ModuleCall{
+							"grandchild": {
+								Providers: []PassedProviderConfig{
+									{
+										InChild: &ProviderConfigRef{
+											Name:  "docker",
+											Alias: "target",
+										},
+										InParent: &ProviderConfigRef{
+											Name:  "docker",
+											Alias: "middle",
+										},
+									},
+								},
+							},
+						},
+					},
+					Children: map[string]*Config{
+						"grandchild": {
+							Module: &Module{
+								ManagedResources: map[string]*Resource{
+									"docker_container.example": {
+										Type: "docker_container",
+										Name: "example",
+										Mode: addrs.ManagedResourceMode,
+										ProviderConfigRef: &ProviderConfigRef{
+											Name:  "docker",
+											Alias: "target",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+				"docker.middle": {
+					Name:  "docker",
+					Alias: "middle",
+				},
+				"docker.target": {
+					Name:  "docker",
+					Alias: "target",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+		},
+		"import uses the existing target resource provider": {
+			testConfigImports: []*Import{
+				{
+					StaticTo: addrs.ConfigResource{
+						Resource: addrs.Resource{
+							Mode: addrs.ManagedResourceMode,
+							Type: "docker_container",
+							Name: "example",
+						},
+					},
+				},
+			},
+			testConfigManagedResources: map[string]*Resource{
+				"docker_container.example": {
+					Type: "docker_container",
+					Name: "example",
+					Mode: addrs.ManagedResourceMode,
+					ProviderConfigRef: &ProviderConfigRef{
+						Name:  "docker",
+						Alias: "special",
+					},
+				},
+			},
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+		},
+		"import into a child follows the module provider mapping": {
+			testConfigImports: []*Import{
+				{
+					StaticTo: addrs.ConfigResource{
+						Module: addrs.Module{
+							"child",
+						},
+						Resource: addrs.Resource{
+							Mode: addrs.ManagedResourceMode,
+							Type: "docker_container",
+							Name: "example",
+						},
+					},
+				},
+			},
+			testConfigModuleCalls: map[string]*ModuleCall{
+				"child": {
+					Providers: []PassedProviderConfig{
+						{
+							InChild: &ProviderConfigRef{
+								Name: "docker",
+							},
+							InParent: &ProviderConfigRef{
+								Name:  "docker",
+								Alias: "special",
+							},
+						},
+					},
+				},
+			},
+			testConfigChildModules: map[string]*Config{
+				"child": {
+					Module: &Module{
+						ManagedResources: map[string]*Resource{
+							"docker_container.example": {
+								Type: "docker_container",
+								Name: "example",
+								Mode: addrs.ManagedResourceMode,
+							},
+						},
+					},
+				},
+			},
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+		},
+		"inherit a default provider with a different child local name": {
+			testConfigModuleCalls: map[string]*ModuleCall{
+				"child": {},
+			},
+			testConfigChildModules: map[string]*Config{
+				"child": {
+					Module: &Module{
+						ProviderRequirements: &RequiredProviders{
+							RequiredProviders: map[string]*RequiredProvider{
+								"cloud": {
+									Name:   "cloud",
+									Source: "hashicorp/aws",
+									Type:   addrs.NewDefaultProvider("aws"),
+								},
+							},
+						},
+						ManagedResources: map[string]*Resource{
+							"aws_s3_bucket.example": {
+								Type: "aws_s3_bucket",
+								Name: "example",
+								Mode: addrs.ManagedResourceMode,
+								ProviderConfigRef: &ProviderConfigRef{
+									Name: "cloud",
+								},
+							},
+						},
+					},
+				},
+			},
+			testFileProviderConfigs: map[string]*Provider{
+				"aws": {
+					Name: "aws",
+				},
+				"cloud": {
+					Name: "cloud",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"aws": {
+					Name: "aws",
+				},
+			},
+		},
+		"copy only the used alias among mixed provider configurations": {
+			testConfigManagedResources: map[string]*Resource{
+				"docker_container.example": {
+					Type: "docker_container",
+					Name: "example",
+					Mode: addrs.ManagedResourceMode,
+					ProviderConfigRef: &ProviderConfigRef{
+						Name:  "docker",
+						Alias: "special",
+					},
+				},
+			},
+			testFileProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+				"docker.unused": {
+					Name:  "docker",
+					Alias: "unused",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+			},
+		},
+
+		"do not copy unused mock providers": {
+			testFileMockProviders: map[string]*MockProvider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{},
+		},
+		"copy an inferred default mock provider": {
+			testConfigManagedResources: map[string]*Resource{
+				"docker_container.example": {
+					Type: "docker_container",
+					Name: "example",
+					Mode: addrs.ManagedResourceMode,
+				},
+			},
+			testFileMockProviders: map[string]*MockProvider{
+				"docker": {
+					Name: "docker",
+				},
+				"unused": {
+					Name: "unused",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name:     "docker",
+					IsMocked: true,
+				},
+			},
+		},
+		"copy only the used mock provider alias": {
+			testConfigManagedResources: map[string]*Resource{
+				"docker_container.example": {
+					Type: "docker_container",
+					Name: "example",
+					Mode: addrs.ManagedResourceMode,
+					ProviderConfigRef: &ProviderConfigRef{
+						Name:  "docker",
+						Alias: "special",
+					},
+				},
+			},
+			testFileMockProviders: map[string]*MockProvider{
+				"docker": {
+					Name: "docker",
+				},
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+				"docker.unused": {
+					Name:  "docker",
+					Alias: "unused",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker.special": {
+					Name:     "docker",
+					Alias:    "special",
+					IsMocked: true,
+				},
+			},
+		},
+		"mock provider overrides an existing configuration": {
+			testConfigProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			testFileMockProviders: map[string]*MockProvider{
+				"docker": {
+					Name: "docker",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name:     "docker",
+					IsMocked: true,
+				},
+			},
+		},
+		"explicit run mapping selects a mock provider": {
+			testRunPassedProviders: []PassedProviderConfig{
+				{
+					InChild: &ProviderConfigRef{
+						Name: "docker",
+					},
+					InParent: &ProviderConfigRef{
+						Name:  "docker",
+						Alias: "special",
+					},
+				},
+			},
+			testFileMockProviders: map[string]*MockProvider{
+				"docker.special": {
+					Name:  "docker",
+					Alias: "special",
+				},
+				"unused": {
+					Name: "unused",
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{
+				"docker": {
+					Name:     "docker",
+					IsMocked: true,
+				},
+			},
+		},
+		"do not evaluate unused mock provider for_each": {
+			testFileMockProviders: map[string]*MockProvider{
+				"docker": {
+					Name:    "docker",
+					ForEach: hcl.StaticExpr(cty.NullVal(cty.DynamicPseudoType), hcl.Range{}),
+				},
+			},
+			expectedProviderConfigs: map[string]*Provider{},
+		},
+	}
+
+	for testName, test := range testTable {
+		t.Run(testName, func(t *testing.T) {
+			// setup
+			config := &Config{
+				Module: &Module{
+					ProviderConfigs: test.testConfigProviderConfigs,
+					Import:          test.testConfigImports,
+					ProviderRequirements: &RequiredProviders{
+						RequiredProviders: test.testConfigProviderReqs,
+					},
+					ManagedResources:   test.testConfigManagedResources,
+					DataResources:      test.testConfigDataResources,
+					EphemeralResources: test.testConfigEphemeralResources,
+					ModuleCalls:        test.testConfigModuleCalls,
+				},
+				Children: test.testConfigChildModules,
+			}
+			run := &TestRun{
+				Providers: test.testRunPassedProviders,
+			}
+			file := &TestFile{
+				Providers:     test.testFileProviderConfigs,
+				MockProviders: test.testFileMockProviders,
+			}
+			evalCtx := &hcl.EvalContext{}
+
+			// execute
+			_, diags := config.getProviderConfigTransformForTest(evalCtx)(run, file)
+			if diags.HasErrors() {
+				t.Fatalf("unexpected diagnostics: %s", diags.Error())
+			}
+
+			// assert
+			if diff := cmp.Diff(
+				config.Module.ProviderConfigs,
+				test.expectedProviderConfigs,
+				cmpopts.IgnoreTypes(VersionConstraint{}),
+				cmpopts.IgnoreFields(Provider{}, "providerType"),
+			); len(diff) > 0 {
+				t.Errorf("unmatched providerconfigs\nexpected:\n%v\nactual:\n%v\ndiff:\n%s",
+					test.expectedProviderConfigs, config.Module.ProviderConfigs, diff)
+			}
 		})
 	}
 }
